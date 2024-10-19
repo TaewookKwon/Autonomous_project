@@ -8,16 +8,17 @@ from geometry_msgs.msg import Point32,PoseStamped
 from sensor_msgs.msg import Imu
 from beginner_tutorials.msg import TrajectoryArray, TrajectoryPoint, TrackingArray, TrackingPoint  # 실제 메시지 파일 경로를 맞게 수정
 from visualization_msgs.msg import Marker, MarkerArray
-from tf.transformations import euler_from_quaternion
 import tf
 import time
+import csv
+from scipy.spatial import distance, KDTree
 from math import pi
 
 AEB = 100
 STOP = 101
 SAFE = 102
 
-
+    
 class Vehicle:
     def __init__(self, position, velocity, acceleration, roll=0.0, pitch=0.0, yaw=0.0, yawrate=0.0):
         self.position = np.array(position)  # [e, n]
@@ -27,31 +28,16 @@ class Vehicle:
         self.yaw = yaw
         self.pitch = pitch
         self.yawrate = yawrate
-
+    
 class CollisionChecker:
     def __init__(self):
         self.vehicle = []
         self.ego_vehicle = []
         #self.current_road_option = 0
-        self.ego_roll = 0.0 # [rad]
+        self.ego_roll = 0.0
         self.ego_pitch = 0.0
         self.ego_yaw = 0.0
         self.min_collision_time = 999
-        
-        # 이륜차 동역학을 고려하는 변수의 초기화
-        self.prev_time = None
-        self.roll = 0
-        self.roll_rate = 0
-        self.roll_accel = 0
-        self.yaw_accel = 0
-        self.prev_roll = None
-        self.prev_roll_rate = 0
-        #self.prev_yaw_rate = None
-        
-        self.h = 1.5  # Vehicle height in meters
-        self.l_m = 2.5  # Distance between wheels in meters
-        self.g = 9.81  # Gravity constant (m/s^2)
-        
         #self.ego_trajectory = TrajectoryArray()
 
         rospy.init_node('collision_checker', anonymous=True)
@@ -121,12 +107,6 @@ class CollisionChecker:
         )
         self.ego_vehicle = ego_vehicle  # Update the ego trajectory
 
-    def odom_callback(self,msg):
-        self.is_odom=True
-        odom_quaternion=(msg.pose.pose.orientation.x,msg.pose.pose.orientation.y,msg.pose.pose.orientation.z,msg.pose.pose.orientation.w)
-        self.ego_roll,_,_=euler_from_quaternion(odom_quaternion)
-        rospy.loginfo(f"ego roll: {self.ego_roll}")
-
     def predict_motion_CV(self, vehicle, time_horizon, dt):
         trajectory_array = TrajectoryArray()
         current_position = vehicle.position
@@ -153,44 +133,6 @@ class CollisionChecker:
 
         return trajectory_array
     
-    def update_roll_rate_and_roll_accel(self, vehicle, ego_roll): # roll rate, roll accel을 계산
-        """Callback to update yaw, roll, and calculate dynamics-based yaw rate."""
-        current_time = rospy.Time.now()
-        #self.roll = vehicle.roll
-        self.yaw = vehicle.yaw  # deg -> rad
-        self.yaw_rate = vehicle.yaw_rate
-        
-
-        if self.prev_time is None:
-            self.prev_time = current_time
-            self.prev_roll = ego_roll
-            #self.prev_yaw_rate = self.yaw_rate
-            return
-        
-        dt = (current_time - self.prev_time).to_sec()
-        
-        self.roll_rate = (ego_roll - self.prev_roll) / dt # Roll rate 계산
-        self.roll_accel = (self.roll_rate - self.prev_roll_rate) / dt # Roll accleration 계산
-        
-        self.prev_time = current_time
-        self.prev_roll = ego_roll
-        self.prev_roll_rate = self.roll_rate
-
-
-        
-    def calculate_yaw_acceleration(self, yaw, yaw_rate, roll, roll_accel, velocity):
-        # yaw acceleration 계산
-        yaw_accel = (
-            - yaw_rate**2 * (self.h / self.l_m) * np.sin(roll)
-            - yaw_rate * (1 / self.l_m) * velocity
-            + (self.h / (self.l_m * np.cos(roll))) * roll_accel
-            - (self.g / self.l_m) * np.tan(roll)
-        )
-        
-        
-        #self.prev_yaw_rate 
-        return yaw_accel
-        
     def predict_motion_CTRV(self, vehicle, time_horizon, dt):
         trajectory_array = TrajectoryArray()
         current_position = vehicle.position
@@ -288,91 +230,6 @@ class CollisionChecker:
 
         return trajectory_array
 
-    def predict_motion_dynamics_1(self, vehicle, ego_roll, time_horizon, dt):
-            trajectory_array = TrajectoryArray()
-            current_position = vehicle.position
-            yaw = vehicle.yaw  # rad/s
-            yawrate = vehicle.yawrate / np.cos(ego_roll) # rad/s
-
-
-            # 속도 크기를 계산 (지도 좌표계에서의 속도 크기)
-            speed = np.sqrt(vehicle.velocity[0]**2 + vehicle.velocity[1]**2)
-
-
-            # Predict position at each time step
-            for t in np.arange(0, time_horizon + dt, dt):
-                point = TrajectoryPoint()
-                
-                if abs(yawrate) > 1e-5:  # Yaw rate is not zero (CTRV model)
-                    del_x = (speed / yawrate) * (np.sin(yaw + yawrate * dt) - np.sin(yaw))
-                    del_y = (speed / yawrate) * (np.cos(yaw) - np.cos(yaw + yawrate * dt))
-
-                    # Update yaw for the next timestep
-                    yaw += yawrate * dt
-                
-                else:  # Yaw rate is zero (straight motion)
-                    del_x = speed * dt * np.cos(yaw)
-                    del_y = speed * dt * np.sin(yaw)
-
-                # Update the point position in global coordinates
-                current_position[0] += del_x
-                current_position[1] += del_y
-                point.x = current_position[0]
-                point.y = current_position[1]
-
-
-                # Update the yaw (yaw increases linearly with time in CTRV model)
-                point.yaw = yaw
-                point.time = t
-
-                trajectory_array.points.append(point)
-
-            return trajectory_array
-
-    def predict_motion_dynamics_2(self, vehicle,  ego_roll, time_horizon, dt):
-            trajectory_array = TrajectoryArray()
-            current_position = vehicle.position
-            yaw = vehicle.yaw  # rad/s
-            yawrate = vehicle.yawrate  # rad/s
-
-            positions = []  # To store [x, y] pairs
-
-            # 속도 크기를 계산 (지도 좌표계에서의 속도 크기)
-            speed = np.sqrt(vehicle.velocity[0]**2 + vehicle.velocity[1]**2)
-
-            self.update_roll_rate_and_roll_accel(vehicle)
-            roll = ego_roll
-            roll_rate = self.roll_rate
-            roll_accel = self.roll_accel
-
-            yaw_accel = self.calculate_yaw_acceleration(yaw, yawrate,roll,roll_accel,speed)
-
-            yawrate += yaw_accel * dt
-            yaw += yawrate * dt
-
-            # Predict position at each time step
-            for t in np.arange(0, time_horizon + dt, dt):
-                point = TrajectoryPoint()
-                
-
-                del_x = (speed / yawrate) * (np.sin(yaw + yawrate * dt) - np.sin(yaw))
-                del_y = (speed / yawrate) * (np.cos(yaw) - np.cos(yaw + yawrate * dt))
-
-                # Update the point position in global coordinates
-                current_position[0] += del_x
-                current_position[1] += del_y
-                point.x = current_position[0]
-                point.y = current_position[1]
-
-
-                # Update the yaw (yaw increases linearly with time in CTRV model)
-                point.yaw = yaw
-                point.time = t
-
-                trajectory_array.points.append(point)
-
-            return trajectory_array
-    
     def calculate_circles_surround(self, position, yaw, vehicle_width, vehicle_length, radius):
         """
         Calculate the positions of 3 circles (front, center, rear) based on vehicle's position and yaw.
@@ -634,14 +491,13 @@ class CollisionChecker:
                 surround_vehicle_id = 1  # ID for surround vehicle
 
                 # Get the ego vehicle's yaw angle
-                ego_yaw = self.ego_vehicle.yaw # rad/s
+                ego_yaw = self.ego_vehicle.yaw # deg/s
 
                 collision_with_behind_vehicle = False
 
                 # Predict Ego vehicle trajectory over the time horizon using the CV model
-                #rospy.loginfo("!!!!!!!!!! {}".format(self.ego_vehicle.velocity))
+                rospy.loginfo("!!!!!!!!!! {}".format(self.ego_vehicle.velocity))
                 ego_trajectory = self.predict_motion_CV(self.ego_vehicle, time_horizon, dt)
-                #ego_trajectory = self.predict_motion_dynamics_1(self.ego_vehicle, self.ego_roll, time_horizon, dt)
 
                 # Calculate the distance between the ego vehicle and the current vehicle
                 ego_position = np.array([ego_trajectory.points[0].x, ego_trajectory.points[0].y])
@@ -652,8 +508,8 @@ class CollisionChecker:
                 vehicles_within_range += 1  # Increment the counter for vehicles within range
 
                 # Predict positions over the time horizon using the CV model
-                #surround_trajectory = self.predict_motion_CTRV(self.vehicle, time_horizon, dt)
                 surround_trajectory = self.predict_motion_CTRV(self.vehicle, time_horizon, dt)
+                #surround_trajectory = self.predict_motion_CTRA(self.vehicle, time_horizon, dt)
 
                 # Ensure surround_trajectory has the same number of points as ego_trajectory
                 if len(surround_trajectory.points) != len(ego_trajectory.points):
@@ -733,6 +589,7 @@ class CollisionChecker:
             #rospy.loginfo(f"Ego position: x = {ego_trajectory.points[0].x}, y = {ego_trajectory.points[0].y}, yaw = {ego_trajectory.points[0].yaw}")
 
             rate.sleep()
+
 
 if __name__ == "__main__":
     # rospy.init_node('collision_risk_node')
